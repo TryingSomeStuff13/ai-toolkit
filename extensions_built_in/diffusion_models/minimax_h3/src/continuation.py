@@ -39,19 +39,27 @@ def _blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
 
 def burn_frames(frames: torch.Tensor, level: float) -> torch.Tensor:
     """The chain drift measured on real Stories, at strength ``level`` in [0, 1] (1 = a long, badly burned chain):
-    etched fine texture (unsharp mask), extra saturation, a darker frame with crushed blacks. ``frames`` is
+    harder facial lines and fine texture (two-scale unsharp mask), mottled grain, a little saturation, a slightly
+    darker frame with crushed blacks. Checked by eye against a real burned Story frame (2026-09-22). ``frames`` is
     (T, C, H, W) in [-1, 1]; returns the same shape and range."""
     level = float(max(0.0, min(1.0, level)))
     x = (frames.float().clamp(-1, 1) + 1) / 2  # [0, 1]
-    # fine texture +20..60%: the "etched" skin (measured +40-60% on faces over long chains)
-    detail = 0.2 + 0.4 * level
-    x = x + detail * (x - _blur(x, 1.5))
-    # saturation +4..15% around the per-pixel grey
+    # the "etched" face (texture measured +40-60% on faces over long chains): fine grain plus harder lines and
+    # folds, i.e. contrast at two scales relative to the frame height (fine ~0.3%, lines ~1%)
+    scale = frames.shape[-2] / 480.0
+    x = x + (0.15 + 0.30 * level) * (x - _blur(x, max(0.8, 1.2 * scale)))
+    x = x + (0.20 + 0.50 * level) * (x - _blur(x, max(1.5, 4.0 * scale)))
+    # mottled, blotchy skin grain (slightly blurred luminance noise, the same pattern on every frame of the run)
+    generator = torch.Generator().manual_seed(1234)
+    grain = torch.randn((1, 1) + tuple(x.shape[-2:]), generator=generator).to(x.device, x.dtype)
+    x = x + (0.008 + 0.022 * level) * _blur(grain, max(0.7, 1.0 * scale))
+    # a little extra saturation (+3..7%); real chains drift in colour both ways, so this stays mild
     grey = (0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3])
-    x = grey + (1.04 + 0.11 * level) * (x - grey)
-    # darker, blacks crushed (frame brightness measured -20% with near-black pixels 38% -> 52%)
-    x = x.clamp(0, 1) ** (1.05 + 0.25 * level)
-    black = 0.01 + 0.04 * level
+    x = grey + (1.03 + 0.04 * level) * (x - grey)
+    # somewhat darker with crushed blacks (the frame's own darkening; kept mild: part of the measured -20% is the
+    # scene, and a dark frame alone is not what reads as burned)
+    x = x.clamp(0, 1) ** (1.02 + 0.10 * level)
+    black = 0.005 + 0.02 * level
     x = ((x - black) / (1 - black)).clamp(0, 1)
     return (x * 2 - 1).to(frames.dtype)
 
