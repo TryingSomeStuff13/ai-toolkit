@@ -29,9 +29,9 @@ class FakeVideoVAE:
         return pooled.expand(b, 24, steps, h // 16, w // 16).clone()
 
 
-def model(context_frames=39):
+def model(context_frames=39, **kwargs):
     m = object.__new__(h3m.MinimaxH3Model)
-    m.model_config = types.SimpleNamespace(model_kwargs={"continuation_context_frames": context_frames} if context_frames else {})
+    m.model_config = types.SimpleNamespace(model_kwargs={"continuation_context_frames": context_frames, **kwargs} if context_frames else {})
     m.model = FakeTransformer()
     m.device_torch = torch.device("cpu"); m.torch_dtype = torch.float32; m.max_text_length = 512
     m.vae_device_torch = torch.device("cpu"); m.vae_torch_dtype = torch.float32
@@ -59,6 +59,37 @@ class Contracts(unittest.TestCase):
         self.assertGreater(texture(burned[1]), texture(burned[0]), "stronger at level 1")
         self.assertLess(grey(burned[1]).mean().item(), grey(frames).mean().item(), "darker")
         self.assertEqual(cont.latent_steps(39), 12); self.assertRaises(ValueError, cont.latent_steps, 40)
+        self.assertTrue(torch.equal(cont.burn_frames(frames, 0.0), frames), "level 0 is the clean context, unchanged")
+        small = cont.burn_frames(frames, 0.05)
+        self.assertLess(texture(small), texture(frames) * 1.15, "the mildest v2 level is a small change")
+
+    def test_settings_and_clean_share(self):
+        self.assertEqual(cont.settings({}), (0, [], 0.0))
+        self.assertEqual(cont.settings({"continuation_context_frames": 39})[1], [1 / 3, 2 / 3, 1.0], "v1 default kept")
+        frames, levels, share = cont.settings({"continuation_context_frames": 39, "continuation_burn_levels": [0, 0.05, 0.1, 0.2],
+                                                "continuation_clean_share": 0.5})
+        self.assertEqual((frames, levels, share), (39, [0.0, 0.05, 0.1, 0.2], 0.5))
+        self.assertRaises(ValueError, cont.settings, {"continuation_context_frames": 39, "continuation_burn_levels": [0.1],
+                                                      "continuation_clean_share": 0.5})  # no clean level to draw
+        self.assertRaises(ValueError, cont.settings, {"continuation_context_frames": 39, "continuation_burn_levels": [1.5]})
+        extras = {f"ctx_burn{i}": torch.full((64, 1), float(i)) for i in range(4)}
+        g = torch.Generator().manual_seed(3)
+        picked = cont.pick_context(extras, 64, levels, 0.5, generator=g).view(-1)
+        clean = (picked == 0).float().mean().item()
+        self.assertTrue(0.3 < clean < 0.7, f"about half clean, got {clean}")
+        self.assertTrue(set(picked.tolist()) == {0.0, 1.0, 2.0, 3.0}, "every burned level is drawn too")
+        self.assertTrue(torch.equal(cont.pick_context(extras, 64, levels, 1.0, generator=g), extras["ctx_burn0"]), "share 1: always clean")
+        never = cont.pick_context(extras, 64, levels, 0.0, generator=g).view(-1)
+        self.assertIn(0.0, never.tolist(), "share 0 (v1 form): every cached level is drawn uniformly")
+
+    def test_clean_context_is_encoded_exactly_like_the_burned_ones(self):
+        m = model(continuation_burn_levels=[0, 0.1], continuation_clean_share=0.5)
+        clip = torch.rand(124, 3, 64, 96) * 2 - 1
+        out = m.encode_images([clip])
+        self.assertEqual(sorted(out.extras), ["ctx_burn0", "ctx_burn1"])
+        alone = FakeVideoVAE().encode(clip[:39].permute(1, 0, 2, 3).unsqueeze(0))
+        self.assertTrue(torch.allclose(out.extras["ctx_burn0"], alone), "level 0: the clean opening, encoded on its own")
+        self.assertFalse(torch.equal(out.extras["ctx_burn0"], out.extras["ctx_burn1"]))
 
     def test_encode_caches_burned_contexts_from_the_same_frames(self):
         m = model()

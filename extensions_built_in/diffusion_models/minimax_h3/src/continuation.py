@@ -7,8 +7,15 @@ first 39 frames are replaced by a synthetically burned copy, protected exactly t
 with the loss on the frames after it only: the model learns not to carry the burn forward.
 
 Enabled per run with ``model_kwargs``:
-  continuation_context_frames: 39     # the protected prefix (a 17n+5 run; 39 = 12 latent steps)
-  continuation_burn_variants: 3       # burned copies cached per clip, mild -> strong; one is drawn per step
+  continuation_context_frames: 39              # the protected prefix (a 17n+5 run; 39 = 12 latent steps)
+  continuation_burn_levels: [0, 0.1, 0.2, 0.4] # contexts cached per clip; level 0 is the clean clip itself
+  continuation_clean_share: 0.5                # share of steps that draw the level-0 (clean) context
+(older runs: ``continuation_burn_variants: N`` = levels 1/N .. 1, no clean context.)
+
+v1 (2026-09-22) had no clean context: every training context was burned, so the LoRA learned "always make the new
+frames softer than the context" and applied it to clean contexts too; a real chain lost about 55% of its fine detail
+over 11 clips. A clean context (level 0, encoded exactly like the burned ones, so encoding is no cue) teaches that
+detail is kept when nothing is wrong, and the burned levels are near what one real clip adds.
 """
 import math
 
@@ -43,40 +50,73 @@ def burn_frames(frames: torch.Tensor, level: float) -> torch.Tensor:
     darker frame with crushed blacks. Checked by eye against a real burned Story frame (2026-09-22). ``frames`` is
     (T, C, H, W) in [-1, 1]; returns the same shape and range."""
     level = float(max(0.0, min(1.0, level)))
+    if level == 0.0:
+        return frames.clone()  # the clean context: identical frames, encoded the same way as the burned ones
     x = (frames.float().clamp(-1, 1) + 1) / 2  # [0, 1]
     # the "etched" face (texture measured +40-60% on faces over long chains): fine grain plus harder lines and
     # folds, i.e. contrast at two scales relative to the frame height (fine ~0.3%, lines ~1%)
     scale = frames.shape[-2] / 480.0
-    x = x + (0.15 + 0.30 * level) * (x - _blur(x, max(0.8, 1.2 * scale)))
-    x = x + (0.20 + 0.50 * level) * (x - _blur(x, max(1.5, 4.0 * scale)))
+    # every effect scales from nothing at level 0 (v1 had a floor, so even its mildest context was strongly burned);
+    # level 1 equals the strongest v1 context
+    x = x + 0.45 * level * (x - _blur(x, max(0.8, 1.2 * scale)))
+    x = x + 0.70 * level * (x - _blur(x, max(1.5, 4.0 * scale)))
     # mottled, blotchy skin grain (slightly blurred luminance noise, the same pattern on every frame of the run)
     generator = torch.Generator().manual_seed(1234)
     grain = torch.randn((1, 1) + tuple(x.shape[-2:]), generator=generator).to(x.device, x.dtype)
-    x = x + (0.008 + 0.022 * level) * _blur(grain, max(0.7, 1.0 * scale))
+    x = x + 0.030 * level * _blur(grain, max(0.7, 1.0 * scale))
     # a little extra saturation (+3..7%); real chains drift in colour both ways, so this stays mild
     grey = (0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3])
-    x = grey + (1.03 + 0.04 * level) * (x - grey)
+    x = grey + (1.0 + 0.07 * level) * (x - grey)
     # somewhat darker with crushed blacks (the frame's own darkening; kept mild: part of the measured -20% is the
     # scene, and a dark frame alone is not what reads as burned)
-    x = x.clamp(0, 1) ** (1.02 + 0.10 * level)
-    black = 0.005 + 0.02 * level
+    x = x.clamp(0, 1) ** (1.0 + 0.12 * level)
+    black = 0.025 * level
     x = ((x - black) / (1 - black)).clamp(0, 1)
     return (x * 2 - 1).to(frames.dtype)
 
 
 def variant_levels(count: int):
-    """Burn strengths of the cached variants, mild to strong."""
+    """Burn strengths of the cached variants, mild to strong (the v1 form: no clean context)."""
     return [(i + 1) / count for i in range(count)]
 
 
-def pick_context(extras: dict, batch_size: int, variants: int, generator=None):
-    """One cached burned context per sample, drawn uniformly from the variants: (B, 24, s, h, w) or None."""
-    options = [extras.get(f"{EXTRA_PREFIX}{i}") for i in range(variants)]
-    options = [o for o in options if o is not None]
-    if not options:
+def settings(kw: dict):
+    """(context frames, burn levels, clean share) from model_kwargs; (0, [], 0.0) when continuation is off."""
+    frames = int(kw.get("continuation_context_frames", 0) or 0)
+    if not frames:
+        return 0, [], 0.0
+    latent_steps(frames)  # validates the 17n+5 run
+    levels = kw.get("continuation_burn_levels")
+    levels = [float(v) for v in levels] if levels else variant_levels(max(1, int(kw.get("continuation_burn_variants", 3))))
+    if any(not 0.0 <= v <= 1.0 for v in levels):
+        raise ValueError(f"continuation_burn_levels must be numbers in [0, 1], got {levels}")
+    share = float(kw.get("continuation_clean_share", 0.0) or 0.0)
+    if not 0.0 <= share <= 1.0 or (share and 0.0 not in levels):
+        raise ValueError("continuation_clean_share needs a value in [0, 1] and a level 0 in continuation_burn_levels")
+    return frames, levels, share
+
+
+def pick_context(extras: dict, batch_size: int, levels, clean_share: float = 0.0, generator=None):
+    """One cached context per sample: the clean one (level 0) with probability ``clean_share``, else one of the
+    burned levels uniformly. With clean_share 0 every cached level is equally likely. (B, 24, s, h, w) or None."""
+    if isinstance(levels, int):
+        levels = variant_levels(levels)
+    found = [(level, extras.get(f"{EXTRA_PREFIX}{i}")) for i, level in enumerate(levels)]
+    found = [(level, o) for level, o in found if o is not None]
+    if not found:
         return None
-    choice = torch.randint(len(options), (batch_size,), generator=generator)
-    return torch.stack([options[int(choice[b])][b] for b in range(batch_size)])
+    clean = [o for level, o in found if level == 0.0]
+    burned = [o for level, o in found if level != 0.0]
+    picks = []
+    for b in range(batch_size):
+        if not clean_share:
+            pool = [o for _, o in found]
+        elif not burned or torch.rand((), generator=generator).item() < clean_share:
+            pool = clean or burned
+        else:
+            pool = burned
+        picks.append(pool[int(torch.randint(len(pool), (1,), generator=generator))][b])
+    return torch.stack(picks)
 
 
 def inject_context(noisy: torch.Tensor, context: torch.Tensor, generator=None) -> torch.Tensor:

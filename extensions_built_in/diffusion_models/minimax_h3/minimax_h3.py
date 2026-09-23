@@ -639,11 +639,11 @@ class MinimaxH3Model(BaseModel):
 
         batch = torch.stack(items).to(self.vae_device_torch, self.video_vae.dtype)
         latents = self.video_vae.encode(batch, sample=True)
-        context_frames, variants = self._continuation_settings()
+        context_frames, levels, _ = self._continuation_settings()
         if context_frames and batch.shape[2] > context_frames:
             # continuation training: burned copies of each clip's opening, from the exact frames just encoded
             extras = {}
-            for index, level in enumerate(h3_continuation.variant_levels(variants)):
+            for index, level in enumerate(levels):
                 burned = torch.stack([
                     h3_continuation.burn_frames(it[:, :context_frames].permute(1, 0, 2, 3), level).permute(1, 0, 2, 3)
                     for it in batch
@@ -654,13 +654,8 @@ class MinimaxH3Model(BaseModel):
         return latents.to(device, dtype=dtype)
 
     def _continuation_settings(self):
-        """(context frames, burn variants) when continuation training is on, else (0, 0)."""
-        kw = self.model_config.model_kwargs or {}
-        frames = int(kw.get("continuation_context_frames", 0) or 0)
-        if not frames:
-            return 0, 0
-        h3_continuation.latent_steps(frames)  # validates the 17n+5 run
-        return frames, max(1, int(kw.get("continuation_burn_variants", 3)))
+        """(context frames, burn levels, clean share) when continuation training is on, else (0, [], 0.0)."""
+        return h3_continuation.settings(self.model_config.model_kwargs or {})
 
     @torch.no_grad()
     def encode_keyframe_latents(self, frames: torch.Tensor) -> torch.Tensor:
@@ -958,10 +953,10 @@ class MinimaxH3Model(BaseModel):
             # --- continuation training: protected, burned prefix ------------
             context_steps = 0
             noisy_before_context = latent_model_input
-            context_frames, variants = self._continuation_settings()
+            context_frames, levels, clean_share = self._continuation_settings()
             if context_frames and batch is not None and batch.num_frames > context_frames:
                 extras = batch.latents.extras if isinstance(batch.latents, DTO) else {}
-                context = h3_continuation.pick_context(extras, batch_size, variants)
+                context = h3_continuation.pick_context(extras, batch_size, levels, clean_share)
                 if context is None and not getattr(self, "_warned_no_context", False):
                     # an old latent cache without the burned contexts would silently train an ordinary LoRA
                     print("MiniMax-H3 continuation: NO burned context in this batch. Delete the dataset's "
