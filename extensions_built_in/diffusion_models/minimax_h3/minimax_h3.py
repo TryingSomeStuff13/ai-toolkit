@@ -53,6 +53,7 @@ from toolkit.dto import DTO
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
 from toolkit.models.v2.text_encoders.qwen3_vl import Qwen3VLTextEncoder
+from .src import continuation as h3_continuation
 from toolkit.models.v2.resolver import (
     find_file_recursive,
     repo_id_from_name_or_path,
@@ -638,7 +639,28 @@ class MinimaxH3Model(BaseModel):
 
         batch = torch.stack(items).to(self.vae_device_torch, self.video_vae.dtype)
         latents = self.video_vae.encode(batch, sample=True)
+        context_frames, variants = self._continuation_settings()
+        if context_frames and batch.shape[2] > context_frames:
+            # continuation training: burned copies of each clip's opening, from the exact frames just encoded
+            extras = {}
+            for index, level in enumerate(h3_continuation.variant_levels(variants)):
+                burned = torch.stack([
+                    h3_continuation.burn_frames(it[:, :context_frames].permute(1, 0, 2, 3), level).permute(1, 0, 2, 3)
+                    for it in batch
+                ]).to(self.vae_device_torch, self.video_vae.dtype)
+                extras[f"{h3_continuation.EXTRA_PREFIX}{index}"] = (
+                    self.video_vae.encode(burned, sample=True).to(device, dtype=dtype))
+            return DTO(latents.to(device, dtype=dtype), **extras)
         return latents.to(device, dtype=dtype)
+
+    def _continuation_settings(self):
+        """(context frames, burn variants) when continuation training is on, else (0, 0)."""
+        kw = self.model_config.model_kwargs or {}
+        frames = int(kw.get("continuation_context_frames", 0) or 0)
+        if not frames:
+            return 0, 0
+        h3_continuation.latent_steps(frames)  # validates the 17n+5 run
+        return frames, max(1, int(kw.get("continuation_burn_variants", 3)))
 
     @torch.no_grad()
     def encode_keyframe_latents(self, frames: torch.Tensor) -> torch.Tensor:
@@ -933,6 +955,26 @@ class MinimaxH3Model(BaseModel):
             for i, emb in enumerate(text_embed_list):
                 text_batch[i, : emb.shape[0]] = emb.to(device, dtype)
 
+            # --- continuation training: protected, burned prefix ------------
+            context_steps = 0
+            noisy_before_context = latent_model_input
+            context_frames, variants = self._continuation_settings()
+            if context_frames and batch is not None and batch.num_frames > context_frames:
+                extras = batch.latents.extras if isinstance(batch.latents, DTO) else {}
+                context = h3_continuation.pick_context(extras, batch_size, variants)
+                if context is None and not getattr(self, "_warned_no_context", False):
+                    # an old latent cache without the burned contexts would silently train an ordinary LoRA
+                    print("MiniMax-H3 continuation: NO burned context in this batch. Delete the dataset's "
+                          "_latent_cache and re-cache with continuation_context_frames set.")
+                    self._warned_no_context = True
+                if context is not None and context.shape[2] < t_lat:
+                    context_steps = int(context.shape[2])
+                    latent_model_input = h3_continuation.inject_context(latent_model_input, context)
+                    rows = h3_continuation.context_row_count(context_steps, h_lat, w_lat)
+                    # the same pin inference applies to protected rows: max(t_v, 0.999)
+                    ctx_t = torch.maximum(t_v, torch.full_like(t_v, h3_continuation.CONTEXT_T))
+                    row_t[:, video_indices[num_cond:num_cond + rows]] = ctx_t.view(-1, 1)
+
             video_rows = patchify_video_latents(
                 latent_model_input.to(device, torch.float32)
             ).to(dtype)
@@ -959,6 +1001,11 @@ class MinimaxH3Model(BaseModel):
 
         video_pred = video_pred[:, num_cond:]
         noise_pred = unpatchify_video_tokens(video_pred, t_lat, h_lat, w_lat)
+        if context_steps:
+            # only the frames after the protected prefix teach (noise_pred is negated below)
+            noise_pred = -h3_continuation.neutralize_prefix(
+                -noise_pred, noisy_before_context, batch.latents.tensor if isinstance(batch.latents, DTO) else batch.latents,
+                sigma_v, context_steps)
         if audio_target is not None:
             # every pass's DTO carries its own audio stream; preds flipped to
             # ai-toolkit's noise - clean convention
