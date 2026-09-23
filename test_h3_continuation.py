@@ -1,12 +1,13 @@
 """CPU contracts for H3 continuation training: the real get_noise_prediction / encode_images with stand-in models."""
-import sys, types, unittest
-sys.path.insert(0, "/home/jeff/ai/ai-toolkit-h3")
+import os, sys, types, unittest
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 import torch
 from toolkit.dto import DTO
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 # load only the H3 module: the package __init__ imports every model, and one needs a GPU at import time
 for name, path in (("extensions_built_in", "extensions_built_in"), ("extensions_built_in.diffusion_models", "extensions_built_in/diffusion_models")):
-    stub = types.ModuleType(name); stub.__path__ = ["/home/jeff/ai/ai-toolkit-h3/" + path]; sys.modules[name] = stub
+    stub = types.ModuleType(name); stub.__path__ = [os.path.join(ROOT, path)]; sys.modules[name] = stub
 from extensions_built_in.diffusion_models.minimax_h3 import minimax_h3 as h3m
 from extensions_built_in.diffusion_models.minimax_h3.src import continuation as cont
 from extensions_built_in.diffusion_models.minimax_h3.src.packing import patchify_video_latents
