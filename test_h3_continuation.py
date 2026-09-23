@@ -24,7 +24,7 @@ class FakeVideoVAE:
     dtype = torch.float32
     def encode(self, frames, sample=True, **kw):  # (B, C, T, H, W) -> (B, 24, steps, H/16, W/16), value = mean frame
         b, c, t, h, w = frames.shape
-        steps = cont.latent_steps(t)
+        steps = 1 if t == 1 else cont.latent_steps(t)
         pooled = torch.nn.functional.adaptive_avg_pool3d(frames.float().mean(1, keepdim=True), (steps, h // 16, w // 16))
         return pooled.expand(b, 24, steps, h // 16, w // 16).clone()
 
