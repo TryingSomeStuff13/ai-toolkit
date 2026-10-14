@@ -613,6 +613,10 @@ class TrainConfig:
         self.do_blank_stabilization = kwargs.get('do_blank_stabilization', False)
         
         self.audio_loss_multiplier = kwargs.get("audio_loss_multiplier", 1.0)
+        # joint audio models: take the audio target from the frozen model (the trained network switched off) on the
+        # same noisy input instead of from the dataset's soundtrack, so the network learns its video task and leaves
+        # the audio as the base model makes it. Costs one extra forward pass (no gradients) per step.
+        self.audio_teacher: bool = kwargs.get("audio_teacher", False)
         
         # will throw detailed error when it goes over
         self.max_loss_debug: bool = kwargs.get("max_loss_debug", False)

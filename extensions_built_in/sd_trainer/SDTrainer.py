@@ -305,8 +305,26 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.eval()
             self.taesd.requires_grad_(False)
 
+    def check_model_train_config(self):
+        """A model can refuse train settings it cannot honour (e.g. MiniMax-H3 trajectory training, whose targets are
+        recorded) before the first step."""
+        check_train_config = getattr(self.sd, "check_train_config", None)
+        if callable(check_train_config):
+            check_train_config(self.train_config)
+
+    def model_training_step_inputs(self, batch, noisy_latents, noise, timesteps):
+        """A model can supply a step's input itself once the trainer has drawn noise and timesteps (e.g. MiniMax-H3
+        trajectory training replays a recorded sampler step); by default nothing changes."""
+        prepare_training_step = getattr(self.sd, "prepare_training_step", None)
+        if callable(prepare_training_step):
+            replaced = prepare_training_step(batch, noisy_latents, noise, timesteps)
+            if replaced is not None:
+                return replaced
+        return noisy_latents, noise, timesteps
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
+        self.check_model_train_config()
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -326,6 +344,9 @@ class SDTrainer(BaseSDTrainProcess):
             self.do_prior_prediction = True
         if getattr(self.sd, 'dopsd_self_ref', False):
             # D-OPSD: the teacher (prior) prediction is the training target
+            self.do_prior_prediction = True
+        if self.train_config.audio_teacher:
+            # the frozen model's audio prediction becomes the audio target (calculate_loss)
             self.do_prior_prediction = True
         # move vae to device if we did not cache latents
         if self.sd.vae is not None:
@@ -644,7 +665,7 @@ class SDTrainer(BaseSDTrainProcess):
                     target = (noise - batch.latents).detach()
                 else:
                     target = noise
-        elif prior_pred is not None and not self.train_config.do_prior_divergence:
+        elif prior_pred is not None and not self.train_config.do_prior_divergence and not self.train_config.audio_teacher:
             assert not self.train_config.train_turbo
             # matching adapter prediction
             target = prior_pred
@@ -1068,12 +1089,22 @@ class SDTrainer(BaseSDTrainProcess):
 
         loss = loss.mean()
         
+        if self.train_config.audio_teacher and isinstance(prior_pred, DTO) and prior_pred.get('audio') is not None:
+            # the frozen model's audio on the same noisy input is the audio target; the video keeps its dataset target
+            audio_target = prior_pred.get('audio').detach()
+
         # check for audio loss
         if audio_pred is not None and audio_target is not None:
             audio_loss = torch.nn.functional.mse_loss(audio_pred.float(), audio_target.float(), reduction="mean")
             audio_loss = audio_loss * self.train_config.audio_loss_multiplier
             self.additional_logs['loss/img'] = loss.item()
             self.additional_logs['loss/audio'] = audio_loss.item()
+            if self.train_config.audio_teacher:
+                # on the console too: at the first step the untrained network equals its teacher, so this starts near 0
+                shown = getattr(self, "_audio_teacher_shown", 0)
+                if shown < 3 or self.step_num % 50 == 0:
+                    print_acc(f"audio teacher: step {self.step_num} audio loss {audio_loss.item():.3e} (video loss {loss.item():.3e})")
+                self._audio_teacher_shown = shown + 1
             loss = loss + audio_loss
 
         # check for additional losses
@@ -1482,6 +1513,7 @@ class SDTrainer(BaseSDTrainProcess):
                     self.sd.text_encoder.to(self.sd.te_torch_dtype)
 
             noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
+            noisy_latents, noise, timesteps = self.model_training_step_inputs(batch, noisy_latents, noise, timesteps)
             if self.train_config.do_cfg or self.train_config.do_random_cfg:
                 # pick random negative prompts
                 if self.negative_prompt_pool is not None:

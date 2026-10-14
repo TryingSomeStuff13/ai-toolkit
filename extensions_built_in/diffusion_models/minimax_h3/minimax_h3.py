@@ -34,6 +34,10 @@ Conventions bridged to ai-toolkit:
   - the audio stream runs on its own flow shift (3 vs video's 12): its sigma
     is derived per step from the video sigma via the closed-form remap, in
     training and sampling alike
+  - pre-quantized checkpoints run with the weights ComfyUI runs
+    (``model_kwargs.match_engine_precision``, on by default): unquantized
+    linear weights rounded to bf16, as the engine the LoRA is used with loads
+    them
 """
 
 import os
@@ -54,6 +58,9 @@ from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
 from toolkit.models.v2.text_encoders.qwen3_vl import Qwen3VLTextEncoder
 from .src import continuation as h3_continuation
+from .src import runtime_lora as h3_runtime_lora
+from .src import trajectory as h3_trajectory
+from .src import turbos as h3_turbos
 from toolkit.models.v2.resolver import (
     find_file_recursive,
     repo_id_from_name_or_path,
@@ -376,13 +383,210 @@ class MinimaxH3Model(BaseModel):
         self.assistant_lora.is_active = True
         self.invert_assistant_lora = False
 
+    def attach_assistant_adaln(self, transformer) -> int:
+        """Opt-in (``model_kwargs.assistant_adaln_lora_path`` + ``assistant_adaln_grid_path``): add a full-model
+        LoRA's adaLN pieces at run time to a pruned checkpoint's adaLN projections, exactly as the ComfyUI
+        MiniMax-H3-Turbo node does at inference (src/adaln_injection.py). The pruned 8-wide projections cannot take
+        them as weights, so an assistant file without them trains against a different turbo than the one inference
+        runs. The update follows the assistant LoRA: on whenever the assistant is on (every training pass,
+        including the audio-teacher pass), off when the sampler switches the assistant off. Strength:
+        ``assistant_adaln_strength`` (default 1.0). Returns the number of projections updated (0 when off)."""
+        kw = self.model_config.model_kwargs or {}
+        lora_path = kw.get("assistant_adaln_lora_path")
+        grid_path = kw.get("assistant_adaln_grid_path")
+        if not lora_path and not grid_path:
+            return 0
+        if not (lora_path and grid_path):
+            raise ValueError("assistant_adaln_lora_path (the full LoRA file) and assistant_adaln_grid_path (the "
+                             "turbo node's h3_silu_temb_grid.safetensors) are set together")
+        strength = float(kw.get("assistant_adaln_strength", 1.0))
+        from .src import adaln_injection
+
+        announced = []
+
+        def first_use():
+            if not announced:
+                announced.append(True)
+                print("MiniMax-H3: assistant adaLN update applied in a forward pass (first time)", flush=True)
+
+        count = adaln_injection.load_and_attach(transformer, lora_path, grid_path, strength,
+                                                active=self._assistant_adaln_active, on_first_use=first_use)
+        print(f"MiniMax-H3: assistant adaLN injection active: {count} adaln projections at strength {strength} "
+              f"(the turbo node's run-time update), from {os.path.basename(lora_path)}", flush=True)
+        return count
+
+    def _assistant_adaln_active(self) -> bool:
+        assistant = getattr(self, "assistant_lora", None)
+        return assistant is None or bool(getattr(assistant, "is_active", True))
+
+    # ------------------------------------------------------------------
+    # Turbos (model_kwargs.turbo, by the turbo registry's names: src/turbos.py)
+    # ------------------------------------------------------------------
+    def _turbo_config(self):
+        """The run's turbos ({name: Turbo}, in config order), resolved once; None without model_kwargs.turbo."""
+        if not hasattr(self, "_turbo_cache"):
+            kw = self.model_config.model_kwargs or {}
+            self._turbo_cache = h3_turbos.configured(kw, self._dit_component()[len("dit_"):],
+                                                     getattr(self.model_config, "assistant_lora_path", None))
+            self._turbo_active = next(iter(self._turbo_cache)) if self._turbo_cache else None
+            self.turbo_set = None
+        return self._turbo_cache
+
+    def _checkpoint_turbo(self):
+        turbos = self._turbo_config()
+        first = next(iter(turbos.values())) if turbos else None
+        return first if first is not None and first.kind == "checkpoint" else None
+
+    def _attach_turbos(self, transformer):
+        """The LoRA turbos, each file mapped onto the transformer tensor by tensor and applied live with the
+        H3RuntimeLoRA node's math (src/runtime_lora.py), never merged; Larry's adaLN pieces through the turbo node's
+        grid (``turbo_adaln_grid_path``). The first listed turbo is live until a step picks one."""
+        turbos = self._turbo_config()
+        kw = self.model_config.model_kwargs or {}
+        lora = [t for t in turbos.values() if t.kind == "lora"]
+        if not lora:
+            return None
+        grid = None
+        if any(t.adaln for t in lora) and kw.get("turbo_adaln_grid_path"):
+            grid_file = load_file(str(kw["turbo_adaln_grid_path"]))
+            if h3_turbos.GRID_KEY not in grid_file:
+                raise ValueError(f"{kw['turbo_adaln_grid_path']} has no {h3_turbos.GRID_KEY!r} tensor (expected the "
+                                 "turbo node's h3_silu_temb_grid)")
+            grid = grid_file[h3_turbos.GRID_KEY]
+        turbo_set = h3_runtime_lora.TurboSet(transformer, keep_on_device=bool(kw.get("turbo_keep_on_device", False)))
+        for t in lora:
+            path = h3_turbos.file_path(t, kw)
+            self.print_and_status_update(f"Loading turbo {t.name} from {path}")
+            p = turbo_set.add(t, load_file(path), grid)
+            print(f"MiniMax-H3 turbo {t.name}: {len(p.backbone)} linears live (H3RuntimeLoRA math, never merged)"
+                  + (f", {len(p.adaln)} adaLN pieces at run time" if p.adaln else "")
+                  + f"; shifts {t.shift_video:g}/{t.shift_audio:g}, {'fixed' if t.sigmas else 'simple'} "
+                  f"{t.steps}-step grid, strength {t.strength:g}", flush=True)
+        self.turbo_set = turbo_set
+        self.activate_turbo(self._turbo_active)
+        return turbo_set
+
+    def activate_turbo(self, name):
+        """Make ``name`` the live assistant: its LoRA (and adaLN pieces) on, every other turbo off, its shifts for
+        the audio clock. A checkpoint turbo is always live (it is the DiT)."""
+        turbos = self._turbo_config()
+        if not turbos:
+            if name is not None:
+                raise ValueError(f"turbo {name}: model_kwargs.turbo names no turbo")
+            return
+        if name not in turbos:
+            raise ValueError(f"turbo {name!r} is not one of this run's turbos ({', '.join(turbos)})")
+        if self.turbo_set is not None:
+            self.turbo_set.activate(name if turbos[name].kind == "lora" else None)
+        self._turbo_active = name
+
+    @property
+    def turbo_active(self):
+        return self._turbo_active if self._turbo_config() else None
+
+    def stream_shifts(self):
+        """(video, audio) shifts of the live turbo, the audio clock's remap; the released 12 / 3 without turbos."""
+        turbos = self._turbo_config()
+        if turbos:
+            return turbos[self._turbo_active].shifts
+        return packing.VIDEO_SIGMA_SHIFT, packing.AUDIO_SIGMA_SHIFT
+
+    def sample_turbo(self):
+        """The turbo previews run with (``turbo_sample``, default the first listed); None without turbos."""
+        turbos = self._turbo_config()
+        if not turbos:
+            return None
+        return turbos[(self.model_config.model_kwargs or {}).get("turbo_sample") or next(iter(turbos))]
+
+    def _train_scheduler(self):
+        """The flow-matching scheduler, at the first turbo's video shift (timestep_type shift draws on it)."""
+        turbos = self._turbo_config()
+        if not turbos:
+            return MinimaxH3Model.get_train_scheduler()
+        return CustomFlowMatchEulerDiscreteScheduler(
+            **{**scheduler_config, "shift": next(iter(turbos.values())).shift_video})
+
+    def generate_images(self, *args, **kwargs):
+        """Training previews run with the sample turbo live, on its own grid and shifts (src/pipeline.py)."""
+        turbo = self.sample_turbo()
+        if turbo is None:
+            return super().generate_images(*args, **kwargs)
+        previous = self._turbo_active
+        self.activate_turbo(turbo.name)
+        try:
+            return super().generate_images(*args, **kwargs)
+        finally:
+            self.activate_turbo(previous)
+
+    def _turbo_training_step(self, batch, noisy_latents, noise, timesteps):
+        """A flow-matching step of a run with several turbos: the step's turbo (``turbo_weights``, uniform by
+        default) goes live for every pass of the step (prior, audio teacher, continuation draws). A timestep drawn
+        on the scheduler's shifted grid (timestep_type shift) moves to the same schedule position on the turbo's
+        shift, with the noisy latents rebuilt from the same clean latents and noise. None when nothing changes."""
+        turbos = self._turbo_config()
+        if not turbos or len(turbos) == 1 or batch is None:
+            return None
+        names = list(turbos)
+        weights = (self.model_config.model_kwargs or {}).get("turbo_weights") or {}
+        w = torch.tensor([float(weights.get(n, 1.0)) for n in names], dtype=torch.float64)
+        name = names[int(torch.multinomial(w, 1))]
+        self.activate_turbo(name)
+        scheduler = self.noise_scheduler
+        if getattr(scheduler, "timestep_type", None) not in ("shift", "flux_shift", "lumina2_shift"):
+            return None
+        base, target = float(scheduler.shift), turbos[name].shift_video
+        if base == target:
+            return None
+        sigma = remap_sigma(timesteps.to(torch.float32) / 1000.0, base, target)
+        clean = batch.latents.tensor if isinstance(batch.latents, DTO) else batch.latents
+        s = sigma.view(-1, *([1] * (noisy_latents.dim() - 1))).to(noisy_latents.device)
+        noisy = (1.0 - s) * clean.to(noisy_latents.device, torch.float32) + s * noise.to(torch.float32)
+        return noisy.to(noisy_latents.dtype), noise, (sigma * 1000.0).to(timesteps.dtype)
+
     def _load_transformer(self) -> MiniMaxH3Transformer:
-        dit_path = self._resolve_comfy_file(self._dit_component())
-        self.print_and_status_update(f"Loading transformer from {dit_path}")
+        checkpoint = self._checkpoint_turbo()
+        if checkpoint is not None:
+            # a checkpoint turbo (merged_turbo): the turbo is baked into its own DiT, which replaces the partition's
+            dit_path = h3_turbos.file_path(checkpoint, self.model_config.model_kwargs or {})
+            if not os.path.isfile(dit_path):
+                raise FileNotFoundError(f"turbo {checkpoint.name}: no DiT at {dit_path}")
+            self.print_and_status_update(f"Loading transformer from {dit_path} (turbo {checkpoint.name})")
+        else:
+            dit_path = self._resolve_comfy_file(self._dit_component())
+            self.print_and_status_update(f"Loading transformer from {dit_path}")
         # the mixin single-file path: config sniffed from the checkpoint
         # (adaln_t_table), pre-quantized ConvRot linears attached, everything
         # else at its stored precision (the bf16/fp16/fp32 mix is deliberate)
-        return MiniMaxH3Transformer.load_model(dit_path, dtype=self.torch_dtype)
+        transformer = MiniMaxH3Transformer.load_model(dit_path, dtype=self.torch_dtype)
+        self.match_engine_precision(transformer)
+        return transformer
+
+    def match_engine_precision(self, transformer: MiniMaxH3Transformer) -> int:
+        """``model_kwargs.match_engine_precision``: run a pre-quantized (comfy_quant) checkpoint with the numerics
+        ComfyUI actually uses for it.
+
+        Its loader for these files (MixedPrecisionOps) rounds every unquantized linear weight to bf16, including the
+        fp16 adaLN projections and the fp32 patch projections and output heads, so the engine's modulation, input
+        embeddings and output heads differ from the stored values by a bf16 rounding.
+
+        ``dynamic`` (default; ComfyUI with DynamicVRAM, which keeps the biases as stored), ``legacy`` (ComfyUI started
+        with --disable-dynamic-vram: biases rounded too) or ``off``. Checkpoints without quantization markers load
+        through ComfyUI's plain ops, which keep the declared dtypes, so nothing changes for them. Returns the number of
+        weight tensors rounded."""
+        kw = self.model_config.model_kwargs or {}
+        mode = str(kw.get("match_engine_precision", "dynamic")).strip().lower()
+        if mode in ("off", "false", "0", "no", "none"):
+            return 0
+        if mode in ("on", "true", "1", "yes"):
+            mode = "dynamic"
+        if mode not in ("dynamic", "legacy"):
+            raise ValueError(f"model_kwargs.match_engine_precision must be dynamic, legacy or off, got {mode!r}")
+        if not getattr(transformer, "aitk_is_quantized", False):
+            return 0
+        count = transformer.match_engine_weight_precision(torch.bfloat16, round_biases=mode == "legacy")
+        print(f"MiniMax-H3: engine precision ({mode}): {count} unquantized linear tensors rounded to bf16 the way "
+              f"ComfyUI loads this checkpoint", flush=True)
+        return count
 
     def _load_text_encoder(self):
         from accelerate import init_empty_weights
@@ -495,15 +699,22 @@ class MinimaxH3Model(BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading MiniMax-H3 model")
 
+        turbos = self._turbo_config()  # model_kwargs.turbo: refuses the single-assistant keys next to it
         transformer = self._load_transformer()
 
-        # load assistant lora if specified (merged into the quantized weights)
-        if self.model_config.assistant_lora_path is not None:
-            self.load_training_adapter(transformer)
+        if turbos is None:
+            # load assistant lora if specified (a live module, never merged into the quantized weights)
+            if self.model_config.assistant_lora_path is not None:
+                self.load_training_adapter(transformer)
+            # the assistant's adaLN pieces on a pruned checkpoint, added at run time like the ComfyUI turbo node
+            self.attach_assistant_adaln(transformer)
 
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
         flush()
+        if turbos is not None:
+            # after placement: the hooks go on the modules the model finally runs
+            self._attach_turbos(transformer)
 
         tokenizer, processor, text_encoder = self._load_text_encoder()
         if any(isinstance(m, OstrisLinear) for m in text_encoder.modules()):
@@ -516,7 +727,7 @@ class MinimaxH3Model(BaseModel):
         vae_bundle = self._load_vaes()
         vae_bundle.to(self.vae_device_torch)
 
-        self.noise_scheduler = MinimaxH3Model.get_train_scheduler()
+        self.noise_scheduler = self._train_scheduler()
         self.vae = vae_bundle
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
@@ -639,7 +850,8 @@ class MinimaxH3Model(BaseModel):
 
         batch = torch.stack(items).to(self.vae_device_torch, self.video_vae.dtype)
         latents = self.video_vae.encode(batch, sample=True)
-        context_frames, levels, _ = self._continuation_settings()
+        continuation = self._continuation_settings()
+        context_frames, levels = continuation.frames, continuation.levels
         if context_frames and batch.shape[2] > context_frames:
             # continuation training: burned copies of each clip's opening, from the exact frames just encoded
             extras = {}
@@ -654,8 +866,71 @@ class MinimaxH3Model(BaseModel):
         return latents.to(device, dtype=dtype)
 
     def _continuation_settings(self):
-        """(context frames, burn levels, clean share) when continuation training is on, else (0, [], 0.0)."""
-        return h3_continuation.settings(self.model_config.model_kwargs or {})
+        """Continuation training settings (h3_continuation.Settings); frames is 0 when it is off. Trajectory training
+        (v6) replaces the burned contexts, so the burned-context mode is off while it runs."""
+        kw = self.model_config.model_kwargs or {}
+        if h3_trajectory.enabled(kw):
+            return h3_continuation.Settings()
+        return h3_continuation.settings(kw)
+
+    def _trajectory_settings(self):
+        """v6 trajectory-training settings (h3_trajectory.Settings); None when it is off."""
+        return h3_trajectory.settings(self.model_config.model_kwargs or {})
+
+    def _trajectory_store_for(self, settings):
+        store = getattr(self, "_trajectory_store", None)
+        if store is None or store.settings != settings:
+            store = self._trajectory_store = h3_trajectory.TrajectoryStore(settings, self._turbo_config())
+        return store
+
+    def check_dataset_config(self, dataset_config):
+        """Called before latent caching (and once at the first step): continuation training refuses datasets that
+        would squeeze clips out of real speed; trajectory training refuses items that have no recording."""
+        trajectory = self._trajectory_settings()
+        if trajectory is not None:
+            store = self._trajectory_store_for(trajectory)
+            count = store.check_dataset(dataset_config)
+            if count:
+                mix = store.turbo_counts(dataset_config)
+                print(f"MiniMax-H3 trajectory training: every one of the {count} dataset items has a recording in "
+                      f"{trajectory.directory}" + (" (" + ", ".join(f"{n} {c}" for n, c in mix.items()) + ")"
+                                                   if mix else ""))
+            return
+        if self._continuation_settings().frames:
+            h3_continuation.check_real_speed(dataset_config)
+
+    def check_train_config(self, train_config):
+        """Called by the trainer before the first step: trajectory training refuses settings that would change the
+        recorded target (audio_teacher, prior/guidance losses, non-MSE losses, ...)."""
+        if self._trajectory_settings() is not None:
+            h3_trajectory.check_train_config(train_config)
+
+    def prepare_training_step(self, batch, noisy_latents, noise, timesteps):
+        """Called by the trainer once its own noise and timesteps are drawn. Trajectory training hands back the
+        recorded step instead (the student's video input and the recorded timestep, 1000 * sigma_v), so every
+        timestep-aware part of the trainer sees the recorded sigma. None when the mode is off (nothing changes)."""
+        trajectory = self._trajectory_settings()
+        if trajectory is None or batch is None:
+            return self._turbo_training_step(batch, noisy_latents, noise, timesteps)
+        samples = self._trajectory_samples(batch, trajectory)
+        video = torch.cat([s.video_in for s in samples]).to(noisy_latents.device, noisy_latents.dtype)
+        timesteps = torch.cat([s.timestep for s in samples]).to(noisy_latents.device, torch.float32)
+        return video, torch.zeros_like(video), timesteps
+
+    def get_additional_loss(self, pred, target):
+        # nothing to add; trajectory training reports its per-sample errors through additional_loss_logs
+        return None
+
+    def _trajectory_samples(self, batch, settings):
+        store = self._trajectory_store_for(settings)
+        samples = h3_trajectory.batch_samples(batch, settings, store)
+        if not store.announced:
+            shares = ", ".join(f"{k} {v:.0%}" for k, v in settings.shares.items())
+            print(f"MiniMax-H3 trajectory training: recordings from {settings.directory} ({shares}; context "
+                  f"{settings.context_frames} frames, audio {'protected' if settings.protect_audio else 'free'}, "
+                  f"text {settings.text}{', sweep' if settings.sweep else ''})")
+            store.announced = True
+        return samples
 
     @torch.no_grad()
     def encode_keyframe_latents(self, frames: torch.Tensor) -> torch.Tensor:
@@ -797,6 +1072,11 @@ class MinimaxH3Model(BaseModel):
         if self.model.device == torch.device("cpu"):
             self.model.to(device)
 
+        trajectory = self._trajectory_settings()
+        if trajectory is not None and batch is not None:
+            # v6: the step's input, timestep and target come from a recorded turbo run (src/trajectory.py)
+            return self._trajectory_prediction(trajectory, text_embeddings, batch)
+
         batch_size, _, t_lat, h_lat, w_lat = latent_model_input.shape
 
         with torch.no_grad():
@@ -805,7 +1085,8 @@ class MinimaxH3Model(BaseModel):
                 sigma_v = sigma_v.unsqueeze(0)
             if sigma_v.shape[0] != batch_size:
                 sigma_v = sigma_v.expand(batch_size)
-            sigma_a = remap_sigma(sigma_v)
+            # the audio clock: the live turbo's shifts (the released 12 / 3 without turbos)
+            sigma_a = remap_sigma(sigma_v, *self.stream_shifts())
             t_v = 1.0 - sigma_v
             t_a = 1.0 - sigma_a
 
@@ -952,11 +1233,21 @@ class MinimaxH3Model(BaseModel):
 
             # --- continuation training: protected, burned prefix ------------
             context_steps = 0
+            audio_row_mask = None
             noisy_before_context = latent_model_input
-            context_frames, levels, clean_share = self._continuation_settings()
-            if context_frames and batch is not None and batch.num_frames > context_frames:
+            continuation = self._continuation_settings()
+            if continuation.frames and batch is not None and not getattr(self, "_checked_dataset", False):
+                # uncached runs never pass through the caching check
+                self.check_dataset_config(getattr(batch, "dataset_config", None))
+                self._checked_dataset = True
+            continues = bool(continuation.frames) and batch is not None and batch.num_frames > continuation.frames
+            plain_step, context = False, None
+            if continues:
                 extras = batch.latents.extras if isinstance(batch.latents, DTO) else {}
-                context = h3_continuation.pick_context(extras, batch_size, levels, clean_share)
+                plain_step, context = h3_continuation.step_draws(
+                    batch, continuation.no_context_share,
+                    lambda: h3_continuation.pick_context(extras, batch_size, continuation.levels, continuation.clean_share))
+            if continues and not plain_step:
                 if context is None and not getattr(self, "_warned_no_context", False):
                     # an old latent cache without the burned contexts would silently train an ordinary LoRA
                     print("MiniMax-H3 continuation: NO burned context in this batch. Delete the dataset's "
@@ -969,6 +1260,25 @@ class MinimaxH3Model(BaseModel):
                     # the same pin inference applies to protected rows: max(t_v, 0.999)
                     ctx_t = torch.maximum(t_v, torch.full_like(t_v, h3_continuation.CONTEXT_T))
                     row_t[:, video_indices[num_cond:num_cond + rows]] = ctx_t.view(-1, 1)
+                    if continuation.protect_audio and raw_audio is not None:
+                        # the context's own soundtrack, protected with the mask inference builds for it
+                        audio_row_mask = h3_continuation.audio_row_mask(h3_continuation.audio_context_mask(
+                            a_lat, h3_continuation.audio_context_steps(continuation.frames))).to(device)
+                        protected, protected_t = h3_continuation.protect_audio_rows(
+                            raw_audio, audio_noise, sigma_a, audio_row_mask)
+                        target_rows = slice(num_cond_audio, num_cond_audio + protected.shape[1])
+                        audio_rows = audio_rows.clone()  # audio_noisy keeps the plain noisy rows
+                        audio_rows[:, target_rows] = protected.to(audio_rows.dtype)
+                        row_t[:, audio_indices[target_rows]] = protected_t
+                        if not getattr(self, "_announced_audio_prefix", False):
+                            m = audio_row_mask
+                            print(f"MiniMax-H3 continuation: audio prefix protected ({int((m == 0).sum())} of {m.numel()} "
+                                  f"audio rows preserved, {int(((m > 0) & (m < 1)).sum())} released)")
+                            self._announced_audio_prefix = True
+            if plain_step and not getattr(self, "_announced_plain_step", False):
+                print(f"MiniMax-H3 continuation: a plain-generation step (no context; share "
+                      f"{continuation.no_context_share})")
+                self._announced_plain_step = True
 
             video_rows = patchify_video_latents(
                 latent_model_input.to(device, torch.float32)
@@ -1004,9 +1314,13 @@ class MinimaxH3Model(BaseModel):
         if audio_target is not None:
             # every pass's DTO carries its own audio stream; preds flipped to
             # ai-toolkit's noise - clean convention
+            audio_out = -audio_pred
+            if audio_row_mask is not None:
+                # only generated audio teaches: the protected soundtrack adds no loss, released ticks count by m
+                audio_out = h3_continuation.blend_protected_audio(audio_out, audio_target, audio_row_mask)
             return DTO(
                 -noise_pred,
-                audio=-audio_pred,
+                audio=audio_out,
                 audio_target=audio_target,
                 audio_noisy=noisy_audio_rows,
                 audio_sigma=sigma_a,
@@ -1016,7 +1330,159 @@ class MinimaxH3Model(BaseModel):
     def get_loss_target(self, *args, **kwargs):
         noise = kwargs.get("noise")
         batch = kwargs.get("batch")
+        samples = getattr(batch, "trajectory_samples", None)
+        if samples is not None and self._trajectory_settings() is not None:
+            # the recorded output (noise - clean, the engine's own velocity); the pinned context's rows carry their
+            # target in the prediction too, so they add no loss
+            return torch.cat([s.video_target for s in samples]).to(noise.device, torch.float32).detach()
         return (noise - batch.latents).detach()
+
+    def _trajectory_prediction(self, settings, text_embeddings, batch):
+        """get_noise_prediction for a recorded step: the student sees the recorded state (context pinned for
+        continuation samples) at the recorded timestep and per-row labels; returns the prediction in ai-toolkit's
+        convention (noise - clean) with the pinned tokens set to their target so only the new tokens teach."""
+        device, dtype = self.device_torch, self.torch_dtype
+        samples = self._trajectory_samples(batch, settings)
+        batch_size = len(samples)
+        shapes = {tuple(s.video_in.shape[1:]) for s in samples} | {("audio",) + tuple(s.audio_in.shape[1:])
+                                                                    for s in samples}
+        if len(shapes) != 2:
+            raise ValueError(f"trajectory samples in one batch must share their latent shapes, got {sorted(shapes)}; "
+                             "use batch_size 1 or same-size recordings")
+        if self._turbo_config():
+            # the frozen assistant of these samples: the turbo their recordings were sampled with
+            names = {s.turbo for s in samples}
+            if len(names) != 1:
+                raise ValueError(f"one batch mixes recordings of turbos {sorted(names)}; the assistant is one turbo per "
+                                 "forward pass (use batch_size 1)")
+            self.activate_turbo(samples[0].turbo)
+
+        with torch.no_grad():
+            video_in = torch.cat([s.video_in for s in samples]).to(device, torch.float32)
+            _, _, t_lat, h_lat, w_lat = video_in.shape
+            if h_lat % 2 or w_lat % 2:
+                raise ValueError(f"trajectory latents need even height and width (2x2 patches), got {h_lat}x{w_lat}")
+            audio_in = torch.cat([s.audio_in for s in samples]).to(device, torch.float32)
+            a_lat = audio_in.shape[1] // packing.AUDIO_CHANNELS
+            sigma_v = torch.cat([s.sigma_v for s in samples]).to(device)
+            sigma_a = torch.cat([s.sigma_a for s in samples]).to(device)
+            t_v = 1.0 - sigma_v
+
+            # conditioning: the recorded Qwen3-VL states (exactly what the engine used) or the dataset caption's
+            embeds, tags = [], []
+            for i, s in enumerate(samples):
+                if s.text_embeds is not None:
+                    embeds.append(s.text_embeds)
+                    tags.append(s.text_tags)
+                else:
+                    e, t = trim_caption_tokens(text_embeddings.text_embeds[i], text_embeddings.text_token_tags[i],
+                                               self.max_text_length)
+                    embeds.append(e)
+                    tags.append(t)
+            layouts = [
+                build_packed_sequence(text_token_tags=tags[i].to("cpu"), num_latent_frames=t_lat,
+                                      latent_height=h_lat, latent_width=w_lat, num_audio_latents=a_lat)
+                for i in range(batch_size)
+            ]
+            position_ids, token_tags, video_indices, audio_indices, text_indices, _ = pad_layouts_to_batch(layouts)
+
+            # per-row labels: text and video at t_v, audio per row (inference's mask labels), pinned video rows at
+            # the context label
+            row_t = t_v.view(-1, 1).expand(-1, token_tags.shape[1]).clone()
+            row_t[:, audio_indices] = torch.stack([s.audio_labels for s in samples]).to(row_t)
+            for i, s in enumerate(samples):
+                if s.context_steps:
+                    rows = h3_continuation.context_row_count(s.context_steps, h_lat, w_lat)
+                    row_t[i, video_indices[:rows]] = s.context_label
+
+            text_batch = torch.zeros(batch_size, int(text_indices.shape[0]), embeds[0].shape[-1], device=device,
+                                     dtype=dtype)
+            for i, emb in enumerate(embeds):
+                text_batch[i, : emb.shape[0]] = emb.to(device, dtype)
+            video_rows = patchify_video_latents(video_in).to(dtype)
+
+        model_inputs = dict(
+            audio_hidden_states=audio_in.to(dtype),
+            encoder_hidden_states=text_batch,
+            row_timesteps=row_t.to(device),
+            token_tags=token_tags.to(device),
+            position_ids=position_ids.to(device),
+            video_indices=video_indices.to(device),
+            audio_indices=audio_indices.to(device),
+            text_indices=text_indices.to(device),
+            vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
+        )
+        video_pred, audio_pred = self.model(hidden_states=video_rows, **model_inputs)
+        # the model predicts clean - noise; ai-toolkit's convention (and the recording's) is noise - clean
+        pred_video = -unpatchify_video_tokens(video_pred, t_lat, h_lat, w_lat)
+        pred_audio = -audio_pred
+
+        floor = None
+        if settings.floor > 0 and not samples[0].logged:
+            # the model's own floor at this step: the same call with the video state nudged by about one bf16 step
+            # (diagnostics only, no gradient). A forward that is not bit-identical to the engine cannot beat it
+            with torch.no_grad():
+                nudged = torch.cat([h3_trajectory.nudge(s.video_in, settings.floor, seed=4321 + s.call) for s in samples])
+                fv, fa = self.model(hidden_states=patchify_video_latents(nudged.to(device)).to(dtype), **model_inputs)
+                floor = (-unpatchify_video_tokens(fv, t_lat, h_lat, w_lat).float(), -fa.float())
+
+        target_video = torch.cat([s.video_target for s in samples]).to(device, torch.float32)
+        target_audio = torch.cat([s.audio_target for s in samples]).to(device, torch.float32)
+        # only the new tokens teach: the pinned context's latent steps take their target (no loss, no gradient), a
+        # protected audio row adds nothing and a released tick counts with its mask value (the v3 rule)
+        steps = torch.tensor([s.context_steps for s in samples], device=device).view(-1, 1, 1, 1, 1)
+        pinned = torch.arange(t_lat, device=device).view(1, 1, -1, 1, 1) < steps
+        pred_video = torch.where(pinned, target_video.to(pred_video.dtype), pred_video)
+        weight = torch.stack([s.audio_weight for s in samples]).to(device, pred_audio.dtype).unsqueeze(-1)
+        pred_audio_blend = target_audio.to(pred_audio.dtype) + weight * (pred_audio - target_audio.to(pred_audio.dtype))
+
+        self._trajectory_log(settings, samples, pred_video, pred_audio, floor)
+        # the per-step floor weighting (continuation_trajectory_step_floors) times the R+ depth weighting
+        # (continuation_trajectory_depth_weights): each sample's loss scaled by its weight, by scaling its residual
+        # with the square root (the logged errors stay unweighted)
+        weights = [settings.sample_weight(s.turbo, s.step, s.depth) for s in samples]
+        if any(w != (1.0, 1.0) for w in weights):
+            wv = torch.tensor([w[0] for w in weights], device=device, dtype=torch.float32).sqrt().view(-1, 1, 1, 1, 1)
+            wa = torch.tensor([w[1] for w in weights], device=device, dtype=torch.float32).sqrt().view(-1, 1, 1)
+            pred_video = target_video.to(pred_video.dtype) + wv.to(pred_video.dtype) * (
+                pred_video - target_video.to(pred_video.dtype))
+            pred_audio_blend = target_audio.to(pred_audio_blend.dtype) + wa.to(pred_audio_blend.dtype) * (
+                pred_audio_blend - target_audio.to(pred_audio_blend.dtype))
+        return DTO(
+            pred_video,
+            audio=pred_audio_blend,
+            audio_target=target_audio.detach(),
+            audio_noisy=audio_in,
+            audio_sigma=sigma_a,
+        )
+
+    def _trajectory_log(self, settings, samples, pred_video, pred_audio, floor=None):
+        """Per-sample errors on the teaching tokens: into the trainer's logs every step, printed for the first steps
+        and then every ``continuation_trajectory_log_every`` samples with the running table by kind and step. With
+        ``floor`` (the prediction on the nudged state) each sample also logs the model's own floor."""
+        if samples[0].logged:
+            return  # a second pass over the same step (none in the supported setups) is not counted twice
+        store = self._trajectory_store_for(settings)
+        logs = {}
+        for i, s in enumerate(samples):
+            s.logged = True
+            errors = h3_trajectory.sample_errors(s, pred_video[i : i + 1].detach(), pred_audio[i : i + 1].detach())
+            if floor is not None:
+                errors.update(h3_trajectory.sample_floor(s, pred_video[i : i + 1].detach(), pred_audio[i : i + 1].detach(),
+                                                         floor[0][i : i + 1], floor[1][i : i + 1]))
+            store.stats.add(s.kind, s.step, float(s.sigma_v), errors, s.turbo)
+            logs = {f"traj/{k}": v for k, v in errors.items()}
+            logs["traj/step"] = float(s.step)
+            if store.stats.total <= 3 or store.stats.total % settings.log_every == 0:
+                extra = (f"; floor video {errors['video_floor']:.2%}, audio {errors['audio_floor']:.2%}"
+                         if "video_floor" in errors else "")
+                print(f"MiniMax-H3 trajectory: {os.path.basename(s.path)}{f' [{s.turbo}]' if s.turbo else ''} {s.kind} "
+                      f"step {s.step} (sigma_v "
+                      f"{float(s.sigma_v):.4f}): video mse {errors['video_mse']:.3e} ({errors['video_rel']:.2%}), "
+                      f"audio mse {errors['audio_mse']:.3e} ({errors['audio_rel']:.2%}){extra}")
+            if store.stats.total % settings.log_every == 0:
+                print("MiniMax-H3 trajectory errors so far (running means):\n" + store.stats.report())
+        self.additional_loss_logs = logs
 
     # ------------------------------------------------------------------
     # Sampling (training previews)

@@ -10,20 +10,52 @@ Enabled per run with ``model_kwargs``:
   continuation_context_frames: 39              # the protected prefix (a 17n+5 run; 39 = 12 latent steps)
   continuation_burn_levels: [0, 0.1, 0.2, 0.4] # contexts cached per clip; level 0 is the clean clip itself
   continuation_clean_share: 0.5                # share of steps that draw the level-0 (clean) context
+  continuation_no_context_share: 0.15         # share of steps with no context at all: plain generation
+  continuation_protect_audio: true             # protect the context's audio too, with inference's own mask
 (older runs: ``continuation_burn_variants: N`` = levels 1/N .. 1, no clean context.)
+The dataset must keep clips at real speed (``shrink_video_to_frames: false``); check_dataset_config refuses otherwise.
 
 v1 (2026-09-22) had no clean context: every training context was burned, so the LoRA learned "always make the new
 frames softer than the context" and applied it to clean contexts too; a real chain lost about 55% of its fine detail
 over 11 clips. A clean context (level 0, encoded exactly like the burned ones, so encoding is no cue) teaches that
 detail is kept when nothing is wrong, and the burned levels are near what one real clip adds.
+
+v3 (2026-09-24), after v2 dulled eyes and made the audio quiet and noise-like:
+- ai-toolkit's ``shrink_video_to_frames`` defaults to true, and it squeezed every clip longer than ``num_frames`` into
+  it: v1/v2 trained on video sped up 1.55x (median, up to 2.9x) with the audio linearly resampled to match
+  (pitched up and aliased). Continuation training now requires real-speed clips.
+- Inference protects the previous clip's AUDIO as well as its frames. Training used to protect only the frames and
+  trained the audio from scratch while the picture had a context. The audio prefix is now protected with the same
+  mask inference builds: exactly clean, labelled t = 1, the last ticks released on a half-cosine.
+- A share of steps has no context at all, so the LoRA also learns to leave a Story's first clip (plain generation,
+  where it never saw a context) as it was.
 """
 import math
+from typing import List, NamedTuple
 
 import torch
 import torch.nn.functional as F
 
 CONTEXT_T = 0.999  # inference injects protected rows at 0.999 * clean + 0.001 * noise and labels them t = 0.999
 EXTRA_PREFIX = "ctx_burn"
+
+# The audio side of the masked AV continuation (ComfyUI-H3-MaskedExtension, existing_video_extension.py, and the H3
+# model's process_denoise_mask / scale_latent_inpaint): 40 Hz audio latents at 24 fps video; protected audio rows are
+# exactly clean and labelled t = max(t_a, 1.0); the last AUDIO_FEATHER_TICKS protected ticks release on a half-cosine;
+# mask values are quantised to 1/256, <= 0.05 -> 0 and >= 0.995 -> 1. Mask value m puts a row at sigma = m * sigma_a.
+FPS = 24
+AUDIO_HZ = 40
+AUDIO_FEATHER_TICKS = 8
+AUDIO_CONTEXT_T = 1.0
+AUDIO_CHANNELS = 2  # packed audio rows are channel-major: all ticks of channel 0, then channel 1
+
+
+class Settings(NamedTuple):
+    frames: int = 0
+    levels: List[float] = []
+    clean_share: float = 0.0
+    no_context_share: float = 0.0
+    protect_audio: bool = False
 
 
 def latent_steps(frames: int) -> int:
@@ -80,11 +112,11 @@ def variant_levels(count: int):
     return [(i + 1) / count for i in range(count)]
 
 
-def settings(kw: dict):
-    """(context frames, burn levels, clean share) from model_kwargs; (0, [], 0.0) when continuation is off."""
+def settings(kw: dict) -> Settings:
+    """Continuation settings from model_kwargs; Settings() (frames 0) when continuation is off."""
     frames = int(kw.get("continuation_context_frames", 0) or 0)
     if not frames:
-        return 0, [], 0.0
+        return Settings()
     latent_steps(frames)  # validates the 17n+5 run
     levels = kw.get("continuation_burn_levels")
     levels = [float(v) for v in levels] if levels else variant_levels(max(1, int(kw.get("continuation_burn_variants", 3))))
@@ -93,7 +125,107 @@ def settings(kw: dict):
     share = float(kw.get("continuation_clean_share", 0.0) or 0.0)
     if not 0.0 <= share <= 1.0 or (share and 0.0 not in levels):
         raise ValueError("continuation_clean_share needs a value in [0, 1] and a level 0 in continuation_burn_levels")
-    return frames, levels, share
+    no_context = float(kw.get("continuation_no_context_share", 0.0) or 0.0)
+    if not 0.0 <= no_context < 1.0:
+        raise ValueError(f"continuation_no_context_share must be in [0, 1), got {no_context}")
+    protect_audio = bool(kw.get("continuation_protect_audio", False))
+    if protect_audio:
+        audio_context_steps(frames)  # the prefix must end on the shared 24 fps / 40 Hz boundary
+    return Settings(frames, levels, share, no_context, protect_audio)
+
+
+def draw_no_context(no_context_share: float, generator=None) -> bool:
+    """True for a step that trains plain generation (no context at all), with probability ``no_context_share``."""
+    return bool(no_context_share) and torch.rand((), generator=generator).item() < no_context_share
+
+
+def step_draws(batch, no_context_share: float, pick):
+    """One draw per training step: ``(plain_step, context)``. Every pass of a step (the audio teacher, the primary)
+    must see the same input, so the draw is kept on the batch; ``pick()`` chooses the context of a continuation step."""
+    draws = getattr(batch, "continuation_draws", None)
+    if draws is None:
+        plain = draw_no_context(no_context_share)
+        draws = (plain, None if plain else pick())
+        batch.continuation_draws = draws
+    return draws
+
+
+def check_real_speed(dataset_config) -> None:
+    """Refuse a video dataset that would squeeze clips longer than num_frames into num_frames (ai-toolkit's default
+    shrink_video_to_frames): the context and the frames after it must run at the speed inference sees, and the
+    squeeze also resamples the audio (pitch and aliasing). Real speed is a random num_frames window at the dataset
+    fps (shrink_video_to_frames: false), or auto_frame_count with trim_auto_frame_count_tail."""
+    if dataset_config is None or int(getattr(dataset_config, "num_frames", 1) or 1) <= 1:
+        return
+    if getattr(dataset_config, "auto_frame_count", False) and getattr(dataset_config, "trim_auto_frame_count_tail", True):
+        return
+    if getattr(dataset_config, "shrink_video_to_frames", True):
+        raise ValueError(
+            "MiniMax-H3 continuation training needs clips at real speed, but this dataset has shrink_video_to_frames "
+            "on (the ai-toolkit default), which squeezes every longer clip into num_frames and resamples its audio. "
+            "Set shrink_video_to_frames: false in the dataset, and delete any _latent_cache made with it on.")
+
+
+def audio_context_steps(frames: int) -> int:
+    """40 Hz audio latents covering a ``frames`` prefix at 24 fps (39 -> 65). Inference only protects AV prefixes that
+    end exactly on both grids (39, 90, 141, ... frames), so anything else is refused."""
+    if (frames * AUDIO_HZ) % FPS:
+        raise ValueError(f"an audio-protected context must end on the shared 24 fps / 40 Hz grid (39, 90, 141, ... "
+                         f"frames), got {frames}")
+    return frames * AUDIO_HZ // FPS
+
+
+def audio_context_mask(total_steps: int, context_steps: int, feather: int = AUDIO_FEATHER_TICKS) -> torch.Tensor:
+    """(total_steps,) inference audio mask, 0 = preserve and 1 = generate: the context ticks preserved, the last
+    ``feather`` of them released on a half-cosine, then quantised the way the H3 model's process_denoise_mask does."""
+    mask = torch.ones(total_steps, dtype=torch.float32)
+    feather = max(0, min(int(feather), context_steps))
+    hard = context_steps - feather
+    mask[:hard] = 0.0
+    if feather:
+        i = torch.arange(1, feather + 1, dtype=torch.float32)
+        mask[hard:context_steps] = 0.5 - 0.5 * torch.cos(math.pi * i / float(feather))
+    mask = torch.round(mask * 256.0) / 256.0
+    return mask.masked_fill(mask >= 0.995, 1.0).masked_fill(mask <= 0.05, 0.0)
+
+
+def engine_audio_context_mask(total_steps: int, context_steps: int, feather: int = AUDIO_FEATHER_TICKS) -> torch.Tensor:
+    """(total_steps,) audio mask as the pod engine's DiT receives it (ComfyUI-H3-test's native token-grid path,
+    MiniMaxH3._token_grid_masks): the same half-cosine release rounded up to 1/256, with no snapping, so the first
+    feathered tick is 10/256 rather than 0. What an R+ recording carries; audio_context_mask stays the mask of the
+    legacy samples."""
+    mask = torch.ones(total_steps, dtype=torch.float32)
+    feather = max(0, min(int(feather), context_steps))
+    hard = context_steps - feather
+    mask[:hard] = 0.0
+    if feather:
+        i = torch.arange(1, feather + 1, dtype=torch.float32)
+        mask[hard:context_steps] = 0.5 - 0.5 * torch.cos(torch.pi * i / float(feather))
+    return torch.ceil(mask * 256.0) / 256.0
+
+
+def audio_row_mask(mask: torch.Tensor) -> torch.Tensor:
+    """A per-tick audio mask -> per packed row (channel-major rows: the ticks of channel 0, then of channel 1)."""
+    return mask.repeat(AUDIO_CHANNELS)
+
+
+def protect_audio_rows(clean: torch.Tensor, noise: torch.Tensor, sigma_a: torch.Tensor, row_mask: torch.Tensor):
+    """Audio rows (B, rows, C) and their timesteps (B, rows) as inference sets them: a row with mask m sits at
+    sigma = m * sigma_a (so fully preserved rows are exactly clean) and is labelled 1 - m * sigma_a, capped at the
+    preserved-row timestep max(t_a, 1.0). Rows with m = 1 match the ordinary noisy audio."""
+    m = row_mask.to(clean.device, torch.float32).view(1, -1)
+    sigma_rows = m * sigma_a.to(clean.device, torch.float32).view(-1, 1)  # (B, rows)
+    s = sigma_rows.unsqueeze(-1)
+    rows = (1.0 - s) * clean.float() + s * noise.float()
+    t_pin = torch.clamp(1.0 - sigma_a.to(clean.device, torch.float32).view(-1, 1), min=AUDIO_CONTEXT_T)
+    return rows.to(clean.dtype), torch.minimum(1.0 - sigma_rows, t_pin)
+
+
+def blend_protected_audio(pred: torch.Tensor, target: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
+    """Only generated audio teaches, at the weight inference gives it: the prediction becomes target + m * (pred -
+    target), so preserved rows (m = 0) add no loss and no gradient and a released row's error is scaled by m."""
+    m = row_mask.to(pred.device, pred.dtype).view(1, -1, 1)
+    return target.to(pred.dtype).detach() + m * (pred - target.to(pred.dtype).detach())
 
 
 def pick_context(extras: dict, batch_size: int, levels, clean_share: float = 0.0, generator=None):

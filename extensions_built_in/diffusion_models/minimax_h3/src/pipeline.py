@@ -44,6 +44,26 @@ from .packing import (
 )
 
 
+def sampling_sigmas(turbo, num_inference_steps: int, t1000_ladder: bool = False):
+    """(sigmas_v, sigmas_a) of a preview run: the released shifted grid (12 / 3), or a turbo's (src/turbos.py Turbo):
+    its shifts, and its fixed grid when it has one (hyperflow_lora), whatever the sample step count. The audio
+    schedule follows the video grid through the closed-form shift remap so both streams sit at the same underlying
+    position."""
+    shift_v, shift_a = (
+        turbo.shifts if turbo is not None else (VIDEO_SIGMA_SHIFT, AUDIO_SIGMA_SHIFT)
+    )
+    if turbo is not None and turbo.sigmas is not None:
+        if num_inference_steps != turbo.steps:
+            print(
+                f"MiniMax-H3 sampler: turbo {turbo.name} runs its fixed "
+                f"{turbo.steps}-step grid (sample_steps {num_inference_steps} ignored)"
+            )
+        sigmas_v = torch.tensor(turbo.sigmas, dtype=torch.float32)
+    else:
+        sigmas_v = build_sigma_schedule(num_inference_steps, shift_v, t1000_ladder=t1000_ladder)
+    return sigmas_v, remap_sigma(sigmas_v, shift_v, shift_a)
+
+
 class MiniMaxH3Pipeline:
     """Lightweight sampler; receives the MinimaxH3Model (BaseModel subclass)
     and reuses its VAEs / transformer / device bookkeeping."""
@@ -200,14 +220,12 @@ class MiniMaxH3Pipeline:
         audio_rows = pack_audio_latents(audio_noise)  # (1, 2*A, 32)
 
         # --- schedules -----------------------------------------------------
-        sigmas_v = build_sigma_schedule(
+        sigmas_v, sigmas_a = sampling_sigmas(
+            model.sample_turbo() if hasattr(model, "sample_turbo") else None,
             num_inference_steps,
-            VIDEO_SIGMA_SHIFT,
             t1000_ladder=getattr(model, "t1000_sample_ladder", False),
-        ).to(device)
-        # the audio schedule follows the video grid through the closed-form
-        # shift remap so both streams sit at the same underlying position
-        sigmas_a = remap_sigma(sigmas_v, VIDEO_SIGMA_SHIFT, AUDIO_SIGMA_SHIFT)
+        )
+        sigmas_v, sigmas_a = sigmas_v.to(device), sigmas_a.to(device)
 
         position_ids = layout.position_ids[None].to(device)
         tags = layout.token_tags[None].to(device)

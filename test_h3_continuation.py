@@ -65,11 +65,13 @@ class Contracts(unittest.TestCase):
         self.assertLess(texture(small), texture(frames) * 1.15, "the mildest v2 level is a small change")
 
     def test_settings_and_clean_share(self):
-        self.assertEqual(cont.settings({}), (0, [], 0.0))
-        self.assertEqual(cont.settings({"continuation_context_frames": 39})[1], [1 / 3, 2 / 3, 1.0], "v1 default kept")
-        frames, levels, share = cont.settings({"continuation_context_frames": 39, "continuation_burn_levels": [0, 0.05, 0.1, 0.2],
-                                                "continuation_clean_share": 0.5})
+        self.assertEqual(cont.settings({}).frames, 0)
+        self.assertEqual(cont.settings({"continuation_context_frames": 39}).levels, [1 / 3, 2 / 3, 1.0], "v1 default kept")
+        s = cont.settings({"continuation_context_frames": 39, "continuation_burn_levels": [0, 0.05, 0.1, 0.2],
+                           "continuation_clean_share": 0.5})
+        frames, levels, share = s.frames, s.levels, s.clean_share
         self.assertEqual((frames, levels, share), (39, [0.0, 0.05, 0.1, 0.2], 0.5))
+        self.assertEqual((s.no_context_share, s.protect_audio), (0.0, False), "v3 options are off unless asked for")
         self.assertRaises(ValueError, cont.settings, {"continuation_context_frames": 39, "continuation_burn_levels": [0.1],
                                                       "continuation_clean_share": 0.5})  # no clean level to draw
         self.assertRaises(ValueError, cont.settings, {"continuation_context_frames": 39, "continuation_burn_levels": [1.5]})
@@ -146,6 +148,161 @@ class Contracts(unittest.TestCase):
         off = model(context_frames=0)
         self.predict(off, noisy, sigma, self.batch(off, clean, {f"ctx_burn0": torch.zeros(1, 24, 12, 4, 6)}))
         self.assertTrue(torch.allclose(off.model.seen["hidden_states"][0], patchify_video_latents(noisy)[0]), "off: contexts ignored")
+
+
+    # --- v3 -----------------------------------------------------------------------------------------------------
+
+    def test_v3_settings(self):
+        s = cont.settings({"continuation_context_frames": 39, "continuation_burn_levels": [0, 0.05],
+                           "continuation_clean_share": 0.5, "continuation_no_context_share": 0.15,
+                           "continuation_protect_audio": True})
+        self.assertEqual((s.no_context_share, s.protect_audio), (0.15, True))
+        self.assertRaises(ValueError, cont.settings, {"continuation_context_frames": 39, "continuation_no_context_share": 1.0})
+        # 22 frames at 24 fps is 36.67 audio ticks: inference cannot protect that AV prefix, so neither does training
+        self.assertRaises(ValueError, cont.settings, {"continuation_context_frames": 22, "continuation_protect_audio": True})
+        cont.settings({"continuation_context_frames": 22})  # video-only protection is still fine
+        g = torch.Generator().manual_seed(5)
+        self.assertFalse(any(cont.draw_no_context(0.0, g) for _ in range(200)))
+        share = sum(cont.draw_no_context(0.3, g) for _ in range(4000)) / 4000
+        self.assertTrue(0.26 < share < 0.34, f"about 30% plain steps, got {share}")
+
+    def test_real_speed_guard(self):
+        ds = lambda **kw: types.SimpleNamespace(num_frames=124, **kw)
+        self.assertRaises(ValueError, cont.check_real_speed, ds(shrink_video_to_frames=True))
+        self.assertRaises(ValueError, cont.check_real_speed, ds())  # ai-toolkit's default is to shrink
+        cont.check_real_speed(ds(shrink_video_to_frames=False))
+        cont.check_real_speed(ds(shrink_video_to_frames=True, auto_frame_count=True, trim_auto_frame_count_tail=True))
+        cont.check_real_speed(types.SimpleNamespace(num_frames=1, shrink_video_to_frames=True))  # images
+        cont.check_real_speed(None)
+        model(context_frames=0).check_dataset_config(ds(shrink_video_to_frames=True))  # off: nothing to guard
+        self.assertRaises(ValueError, model().check_dataset_config, ds(shrink_video_to_frames=True))
+        m = model()  # an uncached run meets the same check at its first step
+        clean = torch.randn(1, 24, 37, 4, 6); sigma = torch.tensor([0.5])
+        batch = types.SimpleNamespace(dataset_config=types.SimpleNamespace(do_i2v=False, do_audio=False, num_frames=124,
+                                                                           shrink_video_to_frames=True),
+                                      num_frames=124, latents=DTO(clean), audio_latents=None)
+        self.assertRaises(ValueError, self.predict, m, clean, sigma, batch)
+
+    @staticmethod
+    def inference_audio_mask(total, context, feather=8):
+        """ComfyUI-H3-MaskedExtension _apply_audio_context_feather, then the H3 model's process_denoise_mask."""
+        mask = torch.ones(total)
+        hard = context - feather
+        mask[:hard] = 0.0
+        i = torch.arange(1, feather + 1, dtype=torch.float32)
+        mask[hard:context] = 0.5 - 0.5 * torch.cos(torch.pi * i / float(feather))
+        mask = torch.round(mask * 256.0) / 256.0
+        return mask.masked_fill(mask >= 0.995, 1.0).masked_fill(mask <= 0.05, 0.0)
+
+    def test_audio_mask_matches_inference(self):
+        self.assertEqual(cont.audio_context_steps(39), 65)
+        self.assertEqual(cont.audio_context_steps(90), 150)
+        self.assertRaises(ValueError, cont.audio_context_steps, 73)
+        m = cont.audio_context_mask(207, 65)
+        self.assertTrue(torch.equal(m, self.inference_audio_mask(207, 65)))
+        self.assertTrue(torch.equal(m[:58], torch.zeros(58)), "57 hard ticks plus the first ramp tick (rounds to 0)")
+        self.assertTrue(bool(((m[58:64] > 0) & (m[58:64] < 1)).all()), "six ticks released gradually")
+        self.assertTrue(torch.equal(m[64:], torch.ones(207 - 64)), "the rest is generated")
+        rows = cont.audio_row_mask(m)
+        self.assertEqual(rows.shape[0], 414)
+        self.assertTrue(torch.equal(rows[:207], rows[207:]), "channel-major rows: both channels share the mask")
+
+    def audio_batch(self, clean, extras, raw_audio, audio_noise):
+        return types.SimpleNamespace(dataset_config=types.SimpleNamespace(do_i2v=False, do_audio=True),
+                                     num_frames=124, latents=DTO(clean, audio_noise=audio_noise, **extras),
+                                     audio_latents=raw_audio)
+
+    def test_training_step_protects_the_audio_prefix_like_inference(self):
+        torch.manual_seed(2)
+        m = model(continuation_protect_audio=True)
+        clean = torch.randn(1, 24, 37, 4, 6); sigma = torch.tensor([0.6])
+        noisy = (1 - sigma) * clean + sigma * torch.randn_like(clean)
+        raw = torch.randn(1, 414, 32); noise = torch.randn(1, 414, 32)
+        ctx = {f"ctx_burn{i}": torch.full((1, 24, 12, 4, 6), float(i + 1)) for i in range(3)}
+        pred = self.predict(m, noisy, sigma, self.audio_batch(clean, ctx, raw, noise))
+        sa = h3m.remap_sigma(sigma).item()
+        mask = cont.audio_row_mask(self.inference_audio_mask(207, 65))
+        hard, released, free = mask == 0, (mask > 0) & (mask < 1), mask == 1
+        self.assertEqual((int(hard.sum()), int(released.sum()), int(free.sum())), (116, 12, 286))
+        seen = m.model.seen["audio_hidden_states"][0]
+        self.assertTrue(torch.allclose(seen[hard], raw[0][hard]), "preserved audio is exactly clean")
+        self.assertTrue(torch.allclose(seen[free], ((1 - sa) * raw + sa * noise)[0][free], atol=1e-6), "generated audio: the noisy target")
+        s_rel = (mask[released] * sa).view(-1, 1)
+        self.assertTrue(torch.allclose(seen[released], (1 - s_rel) * raw[0][released] + s_rel * noise[0][released], atol=1e-6),
+                        "released ticks sit at sigma = m * sigma_a")
+        t = m.model.seen["row_timesteps"][0][m.model.seen["audio_indices"]]
+        self.assertTrue(torch.allclose(t[hard], torch.tensor(1.0)), "preserved audio labelled t = 1 (inference's audio pin)")
+        self.assertTrue(torch.allclose(t[free], torch.tensor(1 - sa)), "generated audio at t_a")
+        self.assertTrue(torch.allclose(t[released], 1 - mask[released] * sa))
+        target = (noise - raw)[0]
+        out = pred.audio[0]  # the fake transformer predicts 0
+        self.assertTrue(torch.allclose(out[hard], target[hard]), "preserved audio: zero loss")
+        self.assertTrue(torch.equal(out[free], torch.zeros_like(out[free])), "generated audio: the model's own prediction")
+        self.assertTrue(torch.allclose(out[released], (1 - mask[released]).view(-1, 1) * target[released], atol=1e-6),
+                        "released ticks: error scaled by m")
+        self.assertTrue(torch.allclose(pred.audio_noisy, (1 - sa) * raw + sa * noise, atol=1e-6), "audio_noisy stays the plain noisy rows")
+
+    def test_audio_is_left_alone_without_protection_or_context(self):
+        torch.manual_seed(3)
+        clean = torch.randn(1, 24, 37, 4, 6); sigma = torch.tensor([0.6])
+        noisy = (1 - sigma) * clean + sigma * torch.randn_like(clean)
+        raw = torch.randn(1, 414, 32); noise = torch.randn(1, 414, 32)
+        ctx = {f"ctx_burn{i}": torch.full((1, 24, 12, 4, 6), float(i + 1)) for i in range(3)}
+        sa = h3m.remap_sigma(sigma).item()
+        plain_audio = ((1 - sa) * raw + sa * noise)[0]
+        m = model()  # v2 form: video prefix only
+        pred = self.predict(m, noisy, sigma, self.audio_batch(clean, ctx, raw, noise))
+        self.assertTrue(torch.allclose(m.model.seen["audio_hidden_states"][0], plain_audio, atol=1e-6))
+        self.assertTrue(torch.equal(pred.audio, torch.zeros_like(pred.audio)))
+
+    def test_no_context_steps_train_plain_generation(self):
+        torch.manual_seed(4)
+        clean = torch.randn(1, 24, 37, 4, 6); sigma = torch.tensor([0.6])
+        noisy = (1 - sigma) * clean + sigma * torch.randn_like(clean)
+        raw = torch.randn(1, 414, 32); noise = torch.randn(1, 414, 32)
+        ctx = {f"ctx_burn{i}": torch.full((1, 24, 12, 4, 6), float(i + 1)) for i in range(3)}
+        m = model(continuation_protect_audio=True, continuation_no_context_share=0.2)
+        original = cont.draw_no_context
+        cont.draw_no_context = lambda share, generator=None: True
+        try:
+            pred = self.predict(m, noisy, sigma, self.audio_batch(clean, ctx, raw, noise))
+        finally:
+            cont.draw_no_context = original
+        self.assertTrue(torch.allclose(m.model.seen["hidden_states"][0], patchify_video_latents(noisy)[0]), "no context injected")
+        self.assertTrue(torch.equal(pred.tensor, torch.zeros_like(pred.tensor)), "every frame teaches")
+        sa = h3m.remap_sigma(sigma).item()
+        self.assertTrue(torch.allclose(m.model.seen["audio_hidden_states"][0], ((1 - sa) * raw + sa * noise)[0], atol=1e-6),
+                        "and the whole soundtrack is generated")
+        self.assertFalse(getattr(m, "_warned_no_context", False), "a planned plain step is not the missing-cache warning")
+
+
+class StepDrawTest(unittest.TestCase):
+    def test_every_pass_of_a_step_sees_the_same_draw(self):
+        class Batch:
+            pass
+
+        picks = []
+
+        def pick():
+            picks.append(1)
+            return torch.randn(1, 24, 12, 4, 4)
+
+        batch = Batch()
+        first = cont.step_draws(batch, 0.5, pick)
+        for _ in range(5):
+            again = cont.step_draws(batch, 0.5, pick)
+            self.assertIs(again[0], first[0])
+            self.assertIs(again[1], first[1])
+        self.assertEqual(len(picks), 0 if first[0] else 1)
+        self.assertEqual(first[1] is None, first[0])
+
+    def test_a_new_step_draws_again(self):
+        class Batch:
+            pass
+
+        plain = [cont.step_draws(Batch(), 0.5, lambda: torch.zeros(1))[0] for _ in range(200)]
+        self.assertEqual(set(plain), {True, False})
+        self.assertEqual({cont.step_draws(Batch(), 0.0, lambda: torch.zeros(1))[0] for _ in range(20)}, {False})
 
 
 if __name__ == "__main__":

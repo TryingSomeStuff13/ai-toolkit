@@ -22,6 +22,14 @@ Mixed precision follows the shipped checkpoint: ``video_patch_proj``,
 and ``rope.inv_freq`` are float32 islands, everything else runs bf16. Inputs
 are aligned to each projection's own parameter dtype at the call site.
 
+Numerics follow ComfyUI's ``comfy/ldm/minimax/model.py`` where it matters: the
+final layer modulates in float32 (``1 + scale`` sits near 0.02-0.05 for most
+channels there, so a bf16 round trip of ``scale`` would move it by up to ~10%),
+gated residuals accumulate with one rounding (``addcmul``, like its
+``_mod_gate``), and the adaLN curve is sampled with its exact formula.
+``match_engine_weight_precision`` reproduces how ComfyUI loads pre-quantized
+checkpoints (unquantized linear weights rounded to bf16).
+
 Timesteps are consumed unscaled in [0, 1] with t = 1 - sigma (t=1 means clean),
 and both heads predict the data-ward velocity ``clean - noise``.
 """
@@ -204,7 +212,13 @@ class MiniMaxH3Attention(nn.Module):
 
 
 class MiniMaxH3Mlp(nn.Module):
-    """SwiGLU: fc1 packs [gate | up]; silu(gate) * up -> fc2. No biases."""
+    """SwiGLU: fc1 packs [gate | up]; silu(gate) * up -> fc2. No biases.
+
+    ``runtime_fc2`` (None by default) is a frozen turbo LoRA's fc2 leg ``leg(out, h)`` (src/runtime_lora.py): its
+    delta on the float32 SwiGLU of fc1's output h, added to fc2's output, where the ComfyUI H3RuntimeLoRA node takes it
+    (the engine's fused SwiGLU + int8 kernel never calls the fc2 module)."""
+
+    runtime_fc2 = None
 
     def __init__(self, hidden: int, ffn: int):
         super().__init__()
@@ -212,8 +226,12 @@ class MiniMaxH3Mlp(nn.Module):
         self.fc2 = nn.Linear(ffn, hidden, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, up = self.fc1(x).chunk(2, dim=-1)
-        return self.fc2(F.silu(gate) * up)
+        h = self.fc1(x)
+        gate, up = h.chunk(2, dim=-1)
+        out = self.fc2(F.silu(gate) * up)
+        if self.runtime_fc2 is not None:
+            out = self.runtime_fc2(out, h)
+        return out
 
 
 class MiniMaxH3AdalnProj(nn.Module):
@@ -226,7 +244,14 @@ class MiniMaxH3AdalnProj(nn.Module):
     overflows here); the weights stay at their stored dtype and are only
     upcast for the matmul, so whole-model casts can't undo this. Outputs are
     float32; the use sites cast them to the block dtype.
+
+    ``adaln_delta`` (None by default) is a run-time update ``delta(temb, x)``
+    applied to the projection's output before the split, e.g. a full-model
+    LoRA's adaLN pieces on a pruned checkpoint (src/adaln_injection.py). The
+    linear is called through F.linear, so LoRA modules on it never fire.
     """
+
+    adaln_delta = None
 
     def __init__(
         self,
@@ -254,6 +279,8 @@ class MiniMaxH3AdalnProj(nn.Module):
         if bias is not None:
             bias = bias.to(device=temb.device, dtype=torch.float32)
         x = F.linear(temb.float(), weight, bias)
+        if self.adaln_delta is not None:
+            x = self.adaln_delta(temb, x)
         x = x.view(x.shape[0] * self.modalities, self.expand * self.hidden)
         return x.chunk(self.expand, dim=-1)
 
@@ -336,14 +363,16 @@ class MiniMaxH3Block(nn.Module):
         h = self.norm1(x) * (1.0 + scale_msa[adaln_indices].to(dt)) + shift_msa[
             adaln_indices
         ].to(dt)
-        x = x + gate_msa[adaln_indices].to(dt) * self.attn(
-            h, rotary_emb, attn_mask, vsa
+        # gated residual with a single rounding, as ComfyUI's _mod_gate
+        # (x.addcmul_(out, gate)); x + gate * out rounds the product first
+        x = torch.addcmul(
+            x, self.attn(h, rotary_emb, attn_mask, vsa), gate_msa[adaln_indices].to(dt)
         )
 
         h = self.norm2(x) * (1.0 + scale_mlp[adaln_indices].to(dt)) + shift_mlp[
             adaln_indices
         ].to(dt)
-        x = x + gate_mlp[adaln_indices].to(dt) * self.mlp(h)
+        x = torch.addcmul(x, self.mlp(h), gate_mlp[adaln_indices].to(dt))
         return x
 
 
@@ -377,11 +406,13 @@ class MiniMaxH3FinalLayer(nn.Module):
         temb: torch.Tensor,  # (M, time_embed_dim)
         timestep_indices: torch.Tensor,  # (B, S) long into the M rows
     ):
-        shift, scale = self.adaln_proj(temb)
-        dt = x.dtype
-        h = self.norm(x) * (1.0 + scale[timestep_indices].to(dt)) + shift[
-            timestep_indices
-        ].to(dt)
+        shift, scale = self.adaln_proj(temb)  # float32
+        # ComfyUI's FinalLayer modulates in float32: the (bf16) norm output
+        # times the float32 (1 + scale), plus the float32 shift. Here most
+        # channels have scale ~ -0.97, so rounding scale to bf16 first would
+        # move 1 + scale by up to ~10% (the blocks' modulation, which ComfyUI
+        # does round to the block dtype, stays in bf16 above)
+        h = self.norm(x) * (1.0 + scale[timestep_indices]) + shift[timestep_indices]
         h = h.to(self.video_out.weight.dtype)
         return self.video_out(h), self.audio_out(h)
 
@@ -407,6 +438,38 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
 
         with init_empty_weights(include_buffers=False):
             return cls(config)
+
+    # tensors a checkpoint may carry that the model does not use (ComfyUI loads them as unexpected keys and ignores
+    # them): a merged-turbo checkpoint's adaLN basis of its hybrid turbo
+    UNUSED_KEYS = ("adaln_basis", "adaln_mean")
+
+    @classmethod
+    def convert_state_dict_on_load(cls, state_dict):
+        for key in cls.UNUSED_KEYS:
+            state_dict.pop(key, None)
+        return state_dict
+
+    @classmethod
+    def _load_single_file(cls, file_path, dtype, config_path=None, config=None, subfolder=None, **kwargs):
+        """Checkpoints that declare their int8 layers in the file metadata (``_quantization_metadata``, e.g. some
+        merged-turbo DiTs) instead of per-layer ``.comfy_quant`` tensors get the markers ComfyUI builds from it
+        (comfy.utils.convert_old_quants): one uint8 JSON tensor per layer."""
+        import json
+
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+
+        with safe_open(file_path, framework="pt") as f:
+            meta = f.metadata() or {}
+        if "_quantization_metadata" not in meta:
+            return super()._load_single_file(file_path, dtype, config_path=config_path, config=config,
+                                             subfolder=subfolder, **kwargs)
+        cls._readahead(file_path)
+        state_dict = load_file(file_path)
+        for layer, conf in json.loads(meta["_quantization_metadata"])["layers"].items():
+            state_dict[f"{layer}.comfy_quant"] = torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
+        return cls.load_from_state_dict(state_dict, dtype, config_path=config_path, config=config,
+                                        subfolder=subfolder, **kwargs)
 
     @classmethod
     def get_transformer_block_names(cls):
@@ -481,14 +544,61 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         if self.time_embedder is not None:
             return self.time_embedder(t)
         table = self.adaln_t_table.float()
-        pos = t.clamp(0.0, 1.0) * (table.shape[0] - 1)
-        # the table may stay CPU-resident under offloading while timesteps
+        # ComfyUI's curve sampling op for op (lower row clamped to the last
+        # interval, torch.lerp), so the curve coordinates, and the turbo
+        # injection's nearest-row lookup on them, match the engine bit for bit.
+        # The table may stay CPU-resident under offloading while timesteps
         # arrive on cuda: interpolate on the table's device, return on t's
-        pos = pos.to(table.device)
-        lo = pos.floor().long()
-        hi = (lo + 1).clamp(max=table.shape[0] - 1)
-        frac = (pos - lo.float()).unsqueeze(1)
-        return (table[lo] * (1.0 - frac) + table[hi] * frac).to(t.device)
+        pos = t.to(device=table.device, dtype=torch.float32).clamp(0.0, 1.0) * (
+            table.shape[0] - 1
+        )
+        i0 = pos.floor().long().clamp(min=0, max=max(table.shape[0] - 2, 0))
+        i1 = (i0 + 1).clamp(max=table.shape[0] - 1)
+        return torch.lerp(table[i0], table[i1], (pos - i0).unsqueeze(1)).to(t.device)
+
+    @torch.no_grad()
+    def match_engine_weight_precision(
+        self, compute_dtype: torch.dtype = torch.bfloat16, round_biases: bool = False
+    ) -> int:
+        """Round the unquantized linears' weights the way ComfyUI loads a
+        pre-quantized (``comfy_quant``) checkpoint. Returns how many tensors
+        changed.
+
+        ComfyUI builds every Linear of such a checkpoint with MixedPrecisionOps,
+        whose loader converts an unquantized layer's weight to the compute dtype
+        (bf16), whatever dtype the model code declares. So the engine runs the
+        fp16 adaLN projections and the fp32 islands (patch projections, output
+        heads, a full checkpoint's time embedder) with bf16-rounded weights,
+        each still computed in its input's dtype (float32 for all of them).
+        Biases keep their stored dtype under DynamicVRAM (its load assigns the
+        checkpoint tensors); the legacy ModelPatcher copies them into
+        compute-dtype parameters (``round_biases=True``).
+
+        Rounded values are kept at float32 storage where the weight was float32
+        (so its call site still computes in float32, like the engine) and moved
+        to the compute dtype otherwise (the adaLN projections upcast per call).
+        Quantized linears are left alone; idempotent."""
+        changed = 0
+        for module in self.modules():
+            if not isinstance(module, nn.Linear) or getattr(
+                module, "is_ostris_quantized", False
+            ):
+                continue
+            for name in ("weight", "bias") if round_biases else ("weight",):
+                param = module._parameters.get(name)
+                if (
+                    param is None
+                    or not param.is_floating_point()
+                    or param.dtype == compute_dtype
+                ):
+                    continue
+                rounded = param.data.to(compute_dtype)
+                new = rounded.to(param.dtype) if param.dtype == torch.float32 else rounded
+                if new.dtype == param.dtype and torch.equal(new, param.data):
+                    continue
+                param.data = new
+                changed += 1
+        return changed
 
     def forward(
         self,

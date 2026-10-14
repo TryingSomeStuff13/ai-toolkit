@@ -1966,6 +1966,10 @@ class LatentCachingMixin:
 
     def cache_latents_all_latents(self: 'AiToolkitDataset'):
         with accelerator.main_process_first():
+            # a model can refuse dataset settings it cannot train on, before anything is encoded
+            check_dataset_config = getattr(self.sd, "check_dataset_config", None)
+            if callable(check_dataset_config):
+                check_dataset_config(self.dataset_config)
             print_acc(f"Caching latents for {self.dataset_path}")
             # cache all latents to disk
             to_disk = self.is_caching_latents_to_disk
